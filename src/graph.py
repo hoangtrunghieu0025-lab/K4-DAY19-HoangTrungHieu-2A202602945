@@ -31,11 +31,52 @@ from typing import Any, Callable
 from .models import Document
 from .store import EmbeddingStore
 
-# Canonical substance names: the ones BLHS Chương XX lists, plus common ones in Vietnamese news.
+# Canonical substance names and slang mapping
+CANONICAL_SUBSTANCES = {
+    "heroine": "Heroine",
+    "heroin": "Heroine",
+    "cocaine": "Cocaine",
+    "methamphetamine": "Methamphetamine",
+    "meth": "Methamphetamine",
+    "ma túy đá": "Methamphetamine",
+    "đá": "Methamphetamine",
+    "amphetamine": "Amphetamine",
+    "mdma": "MDMA",
+    "thuốc lắc": "MDMA",
+    "kẹo": "MDMA",
+    "xlr-11": "XLR-11",
+    "ketamine": "Ketamine",
+    "cần sa": "Cần sa",
+    "thuốc phiện": "Thuốc phiện",
+    "côca": "Côca",
+    "etomidate": "Etomidate",
+}
+NOISE_SUBSTANCES = {"chất ma túy", "ma túy", "ma túy tổng hợp", "ma tuý", "chất ma tuý"}
 SUBSTANCES = ["Heroine", "Cocaine", "Methamphetamine", "Amphetamine", "MDMA", "XLR-11", "Ketamine",
-              "cần sa", "thuốc phiện", "côca"]
+              "Cần sa", "Thuốc phiện", "Côca", "Etomidate"]
 CLAUSE_START = re.compile(r"^(\d+)\.\s", re.MULTILINE)
 FOOTNOTE = re.compile(r"\[\d+\]")
+
+def canonical_substance(name: str) -> str | None:
+    if not name:
+        return None
+    raw = name.strip().lower()
+    if raw in NOISE_SUBSTANCES:
+        return None
+    if raw in CANONICAL_SUBSTANCES:
+        return CANONICAL_SUBSTANCES[raw]
+    for k, v in CANONICAL_SUBSTANCES.items():
+        if k in raw:
+            return v
+    return name.strip().title()
+
+def find_substances(text: str) -> list[str]:
+    lowered = text.lower()
+    found = set()
+    for slang, canon in CANONICAL_SUBSTANCES.items():
+        if slang in lowered:
+            found.add(canon)
+    return sorted(found)
 
 def load_markdown_docs(folder: str | Path) -> list[Document]:
     """Read crawler output (.md with a flat `key: "value"` front matter) into Documents."""
@@ -66,10 +107,6 @@ def link_entity(name: str, known: list[str], normalize: Callable[[str], str] = n
     if matches:
         return norm_map[matches[0]]
     return None
-
-def find_substances(text: str) -> list[str]:
-    lowered = text.lower()
-    return [name for name in SUBSTANCES if name.lower() in lowered]
 
 # ----------------------------------------------------------------------------------------------
 # HINT — suggested ontology: extraction helpers
@@ -137,6 +174,14 @@ def extract_news_cases(doc: Document, llm_fn: Callable[[str], str], known_crimes
         return []
     for case in cases:
         case["charges"] = sorted({c for c in (link_entity(x, known_crimes) for x in case.get("charges", [])) if c})
+        # Canonicalize substances in news to eliminate duplicates and map street slang
+        clean_substances = []
+        for s in case.get("substances", []):
+            can_name = canonical_substance(s.get("name", ""))
+            if can_name:
+                clean_substances.append({"name": can_name, "amount": s.get("amount", "")})
+        case["substances"] = clean_substances
+
         for person in case.get("people", []):
             person["charge"] = link_entity(person.get("charge") or "", known_crimes) or ""
     return cases
@@ -244,7 +289,12 @@ class Neo4jGraph:
                 SET r.amount = s.amount)
             FOREACH (p IN $people | MERGE (person:Person {name: p.name})
                 SET person.aliases = coalesce(p.aliases, [])
-                MERGE (person)-[r:INVOLVED_IN]->(k) SET r.role = p.role, r.charge = p.charge, r.sentence = p.sentence)
+                MERGE (person)-[r:INVOLVED_IN]->(k) SET r.role = p.role, r.charge = p.charge, r.sentence = p.sentence
+                FOREACH (ch IN CASE WHEN p.charge = '' OR p.charge IS NULL THEN [] ELSE [p.charge] END |
+                    MERGE (crime_node:Crime {name: ch})
+                    MERGE (person)-[:ACCUSED_OF]->(crime_node)
+                )
+            )
             """,
             name=case.get("name") or doc.metadata.get("title", doc.id),
             summary=case.get("summary", ""), date=case.get("date", ""), location=case.get("location", ""),
@@ -258,6 +308,26 @@ class Neo4jGraph:
     def context(self, question: str, doc_ids: list[str], max_facts: int = 60) -> list[str]:
         """Graph facts for a question: seeds + 1 hop, then the legal basis of every case reached."""
         seed_ids, facts = self.seed_facts(question, doc_ids, limit=max_facts)
+
+        # 0. Direct person accusation (Person -> ACCUSED_OF -> Crime <- DEFINES - Article -> Clause)
+        person_clauses = self.run(
+            """
+            MATCH (p:Person)
+            WHERE elementId(p) IN $ids
+               OR (p.name IS :: STRING AND size(p.name) >= 3 AND toLower($q) CONTAINS toLower(p.name))
+               OR any(a IN coalesce(p.aliases, []) WHERE size(a) >= 3 AND toLower($q) CONTAINS toLower(a))
+            MATCH (p)-[:ACCUSED_OF]->(c:Crime)<-[:DEFINES]-(a:Article)-[:HAS_CLAUSE]->(cl:Clause)
+            WHERE cl.number = 1
+               OR (toLower($q) CONTAINS 'tối đa' AND cl.number >= 3)
+               OR (toLower($q) CONTAINS 'cao nhất' AND cl.number >= 3)
+            RETURN DISTINCT p.name AS person, c.name AS crime, a.id AS article_id, a.title AS title,
+                            cl.number AS number, cl.text AS text, cl.penalty AS penalty
+            ORDER BY a.id, cl.number
+            """,
+            ids=seed_ids, q=question,
+        )
+        for row in person_clauses:
+            facts.append(f"[{row['person']} bị bắt/khởi tố về hành vi '{row['crime']}' - {row['article_id']}] khoản {row['number']}: {row['text']}")
 
         # 1. Cases that are a seed or adjacent to one
         cases = self.run(
